@@ -15,11 +15,15 @@ Air Canvas 3D - v2 (One Euro Filter 적용)
   - 세그먼트별 색상 저장: 'B'는 이후에 그리는 선에만 적용
   - Backspace undo: 제스처와 무관하게 고정 픽셀 길이만큼 tail 삭제
   - 새끼손가락 줌 제어: 새끼손가락만 핀 상태에서 위=zoom in, 아래=zoom out
+  - 손 전체 펼침 pan 제어: 손바닥 이동으로 카메라 XY 이동
+  - 주먹 orbit 제어: 그린 궤적 중심 기준으로 3D 뷰 회전
 
 제스처:
   - 검지만 펼침         → drawing mode
   - 검지+중지 펼침      → pen up
   - 새끼손가락만 펼침    → zoom control
+  - 다섯손가락 모두 펼침 → pan control
+  - 주먹(모두 접힘)      → orbit control
 
 3D 창 키:
   - 'c'                 → 모두 지우기
@@ -52,8 +56,14 @@ PINKY_ZOOM_DEADZONE = 0.003      # 새끼손가락 y 이동 deadzone
 PINKY_ZOOM_SENSITIVITY = 2.8     # y 변화량 -> zoom 변화 비율
 ZOOM_MIN = 0.10
 ZOOM_MAX = 3.0
-PINKY_UP_MARGIN = 0.020          # 새끼손가락 펴짐 판정 완화
-OTHER_FOLDED_MARGIN = 0.020      # 나머지 손가락 접힘 판정 완화
+PINKY_UP_MARGIN = 0.040          # 새끼손가락 펴짐 판정 완화
+OTHER_FOLDED_MARGIN = 0.045      # 나머지 손가락 접힘 판정 완화
+THUMB_OPEN_AUX_DIST = 0.12       # 엄지 펼침 보조 판정 (엄지-검지 거리)
+THUMB_FIST_AUX_DIST = 0.08       # 엄지 접힘 보조 판정 (엄지-검지 거리)
+PAN_DEADZONE = 0.004             # 손바닥 이동 deadzone
+PAN_SENSITIVITY = 1600.0         # 정규화 이동량 -> Open3D translate delta
+ORBIT_DEADZONE = 0.004           # 주먹 모드 회전 deadzone
+ORBIT_SENSITIVITY = 2200.0       # 정규화 이동량 -> Open3D rotate delta
 
 # Brush 스타일
 BRUSH_PALETTE = [
@@ -173,6 +183,7 @@ def is_finger_extended(landmarks, finger_name):
 
 
 def classify_gesture(landmarks):
+    th = is_finger_extended(landmarks, "thumb")
     idx = is_finger_extended(landmarks, "index")
     mid = is_finger_extended(landmarks, "middle")
     ring = is_finger_extended(landmarks, "ring")
@@ -184,13 +195,23 @@ def classify_gesture(landmarks):
     ring_tip, ring_pip = landmarks[TIP_IDS["ring"]], landmarks[PIP_IDS["ring"]]
     pinky_tip, pinky_pip = landmarks[TIP_IDS["pinky"]], landmarks[PIP_IDS["pinky"]]
 
-    pinky_up = pinky_tip.y < (pinky_pip.y + PINKY_UP_MARGIN)
+    pinky_up = pinky or (pinky_tip.y < (pinky_pip.y + PINKY_UP_MARGIN))
     idx_folded = idx_tip.y > (idx_pip.y - OTHER_FOLDED_MARGIN)
     mid_folded = mid_tip.y > (mid_pip.y - OTHER_FOLDED_MARGIN)
     ring_folded = ring_tip.y > (ring_pip.y - OTHER_FOLDED_MARGIN)
 
     if pinky_up and idx_folded and mid_folded and ring_folded:
         return "zoom_control"
+
+    thumb_tip = landmarks[TIP_IDS["thumb"]]
+    thumb_open_aux = math.hypot(thumb_tip.x - idx_tip.x, thumb_tip.y - idx_tip.y) > THUMB_OPEN_AUX_DIST
+    if (th or thumb_open_aux) and idx and mid and ring and pinky:
+        return "pan_control"
+
+    thumb_fold_aux = math.hypot(thumb_tip.x - idx_tip.x, thumb_tip.y - idx_tip.y) < THUMB_FIST_AUX_DIST
+    if idx_folded and mid_folded and ring_folded and (not pinky_up) and ((not th) or thumb_fold_aux):
+        return "orbit_control"
+
     if idx and not mid and not ring and not pinky:
         return "draw"
     if idx and mid and not ring and not pinky:
@@ -354,6 +375,16 @@ def set_default_view():
 set_default_view()
 current_zoom = 0.6
 prev_pinky_y = None
+prev_palm_xy = None
+prev_orbit_xy = None
+prev_mode = "none"
+
+
+def get_trajectory_center():
+    pts = [p for s in strokes_smooth for p in s]
+    if not pts:
+        return np.array([0.0, 0.0, 0.0], dtype=float)
+    return np.mean(np.array(pts, dtype=float), axis=0)
 
 
 def apply_line_width(vis_obj):
@@ -461,10 +492,13 @@ def cb_clear(vis_obj):
 
 
 def cb_reset(vis_obj):
-    global current_zoom, prev_pinky_y
+    global current_zoom, prev_pinky_y, prev_palm_xy, prev_orbit_xy, prev_mode
     set_default_view()
     current_zoom = 0.6
     prev_pinky_y = None
+    prev_palm_xy = None
+    prev_orbit_xy = None
+    prev_mode = "none"
     print("[reset view]")
     return False
 
@@ -548,6 +582,8 @@ print("=" * 60)
 print("  검지만 펼침      → 그리기")
 print("  검지+중지 펼침   → pen up")
 print("  새끼손가락만 펼침 → 위로 이동: zoom in / 아래로 이동: zoom out")
+print("  다섯손가락 펼침   → 손 이동으로 카메라 pan (xy)")
+print("  주먹               → 그린 궤적 중심 기준 orbit 회전")
 print("  3D창 'C'         → 지우기")
 print("  3D창 'R'         → 시점 리셋")
 print("  3D창 'T'         → raw 궤적 토글")
@@ -606,8 +642,59 @@ try:
                         )
                         vis.get_view_control().set_zoom(current_zoom)
                 prev_pinky_y = pinky_tip.y
+                prev_palm_xy = None
+                prev_orbit_xy = None
+            elif gesture == "pan_control":
+                # 손바닥 중심(손목+MCP들 평균) 이동으로 카메라 평행이동
+                palm = np.mean(
+                    np.array([
+                        [lm[0].x, lm[0].y],   # wrist
+                        [lm[5].x, lm[5].y],   # index MCP
+                        [lm[9].x, lm[9].y],   # middle MCP
+                        [lm[13].x, lm[13].y], # ring MCP
+                        [lm[17].x, lm[17].y], # pinky MCP
+                    ], dtype=float),
+                    axis=0,
+                )
+                if prev_palm_xy is not None:
+                    dxy = palm - prev_palm_xy
+                    dx, dy = float(dxy[0]), float(dxy[1])
+                    if abs(dx) > PAN_DEADZONE or abs(dy) > PAN_DEADZONE:
+                        vis.get_view_control().translate(
+                            dx * PAN_SENSITIVITY,
+                            -dy * PAN_SENSITIVITY,
+                        )
+                prev_palm_xy = palm
+                prev_pinky_y = None
+                prev_orbit_xy = None
+            elif gesture == "orbit_control":
+                # 주먹 모드 진입 시 궤적 중심을 lookat으로 고정해 3D 회전
+                palm = np.mean(
+                    np.array([
+                        [lm[0].x, lm[0].y], [lm[5].x, lm[5].y], [lm[9].x, lm[9].y],
+                        [lm[13].x, lm[13].y], [lm[17].x, lm[17].y]
+                    ], dtype=float),
+                    axis=0,
+                )
+                if prev_mode != "orbit_control":
+                    vis.get_view_control().set_lookat(get_trajectory_center())
+                if prev_orbit_xy is not None:
+                    dxy = palm - prev_orbit_xy
+                    dx, dy = float(dxy[0]), float(dxy[1])
+                    if abs(dx) > ORBIT_DEADZONE or abs(dy) > ORBIT_DEADZONE:
+                        vis.get_view_control().rotate(
+                            dx * ORBIT_SENSITIVITY,
+                            dy * ORBIT_SENSITIVITY,
+                        )
+                prev_orbit_xy = palm
+                prev_pinky_y = None
+                prev_palm_xy = None
             else:
                 prev_pinky_y = None
+                prev_palm_xy = None
+                prev_orbit_xy = None
+
+            prev_mode = gesture
 
             # 마커는 smoothed 좌표로
             delta = tip_smooth - prev_marker_pos
@@ -655,11 +742,16 @@ try:
             # 손 사라지면 필터 리셋 (다시 잡혔을 때 점프 방지)
             euro.reset()
             prev_pinky_y = None
+            prev_palm_xy = None
+            prev_orbit_xy = None
+            prev_mode = "none"
 
         # HUD
         mode_color = {
             "draw": (0, 255, 0), "pen_up": (0, 255, 255),
             "zoom_control": (255, 140, 0),
+            "pan_control": (80, 180, 255),
+            "orbit_control": (255, 100, 180),
             "other": (180, 180, 180), "no_hand": (0, 0, 255),
         }.get(gesture, (255, 255, 255))
         total = sum(len(s) for s in strokes_smooth)
