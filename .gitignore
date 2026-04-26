@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments (do not commit)
+venv/
+.venv/
+env/
+
+# Project-generated outputs
+trajectory_*.png
