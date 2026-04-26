@@ -7,6 +7,12 @@ Air Canvas 3D - v2 (One Euro Filter 적용)
   - 't' 키로 raw vs smoothed 궤적 비교 토글
   - 's' 키로 현재 궤적 PNG로 저장 (리포트 figure용)
   - 'r' 키 시점 리셋 강화
+  - 브러시 스타일: 8색 팔레트 순환(B키) 색상 모드
+  - 브러시 스타일은 3D 궤적에만 반영 (웹캠에는 비표시)
+  - smoothed 궤적 렌더링을 LineSet -> Cylinder Mesh로 변경
+    (macOS에서도 두께 변화가 눈에 보이도록 개선)
+  - 세그먼트별 두께 저장: '['/']'는 이후에 그리는 선에만 적용
+  - 세그먼트별 색상 저장: 'B'는 이후에 그리는 선에만 적용
 
 제스처:
   - 검지만 펼침         → drawing mode
@@ -16,6 +22,9 @@ Air Canvas 3D - v2 (One Euro Filter 적용)
   - 'c'                 → 모두 지우기
   - 'r'                 → 시점 완전 리셋
   - 't'                 → raw 궤적 표시 토글 (비교용)
+  - 's'                 → 현재 3D 뷰 PNG 저장
+  - 'b'                 → 브러시 색상 전환 (빨주노초파남보/검정)
+  - '[' / ']'           → 3D 선 두께 감소/증가
   - 'q' / ESC           → 종료
   - (웹캠 창에서도 동일)
 """
@@ -35,6 +44,25 @@ FRAME_W, FRAME_H = 1280, 720
 Z_AMPLIFY = 5.0
 MAX_POINTS_PER_STROKE = 5000
 MIN_POINT_DISTANCE = 0.003       # 너무 촘촘한 점 제거
+
+# Brush 스타일
+BRUSH_PALETTE = [
+    ("Red",    [1.0, 0.0, 0.0]),
+    ("Orange", [1.0, 0.5, 0.0]),
+    ("Yellow", [1.0, 1.0, 0.0]),
+    ("Green",  [0.0, 1.0, 0.0]),
+    ("Blue",   [0.0, 0.2, 1.0]),
+    ("Navy",   [0.1, 0.1, 0.55]),
+    ("Violet", [0.56, 0.0, 1.0]),
+    ("Black",  [0.02, 0.02, 0.02]),
+]
+brush_color_index = 0
+LINE_WIDTH_MIN = 1.0
+LINE_WIDTH_MAX = 12.0
+LINE_WIDTH_STEP = 1.0
+line_width = 3.0
+LINE_WIDTH_TO_RADIUS = 0.0009    # line_width -> cylinder radius 변환
+CYLINDER_RESOLUTION = 10
 
 # One Euro filter 파라미터 (튜닝 가능)
 # x/y는 비교적 정확하니 약하게, z는 노이즈 많으니 강하게
@@ -168,10 +196,11 @@ vis.add_geometry(axis)
 # 데이터 구조
 strokes_smooth = [[]]   # smoothed 궤적
 strokes_raw = [[]]      # raw 궤적 (비교용)
+strokes_ts = [[]]       # 포인트 timestamp
+strokes_seg_metrics = [[]]  # 각 segment 메타데이터 [{"speed":.., "width":.., "color":[r,g,b]}, ...]
 
-# LineSet: smoothed 메인 궤적
-line_set_smooth = o3d.geometry.LineSet()
-vis.add_geometry(line_set_smooth)
+# smoothed 메인 궤적 (두께 표현용 triangle mesh)
+smooth_mesh = None
 
 # LineSet: raw 궤적 (토글로 표시)
 line_set_raw = o3d.geometry.LineSet()
@@ -188,30 +217,76 @@ prev_marker_pos = np.array([0.0, 0.0, 0.0])
 euro = Vec3OneEuro(ONE_EURO_PARAMS_XY, ONE_EURO_PARAMS_Z)
 
 
-def update_line_set_smooth():
-    pts, lines, colors = [], [], []
-    offset = 0
-    for stroke in strokes_smooth:
-        if len(stroke) < 2:
-            offset += len(stroke)
-            continue
-        for i, p in enumerate(stroke):
-            pts.append(p)
-            if i > 0:
-                lines.append([offset + i - 1, offset + i])
-                z_norm = np.clip(p[2] / 0.5 + 0.5, 0, 1)
-                colors.append([z_norm, 0.4, 1.0 - z_norm])
-        offset += len(stroke)
+def map_metric_to_rgb(metric):
+    """segment에 저장된 색상을 RGB로 반환."""
+    return np.array(metric["color"], dtype=float)
 
-    line_set_smooth.points = o3d.utility.Vector3dVector(
-        np.array(pts) if pts else np.zeros((0, 3))
-    )
-    if lines:
-        line_set_smooth.lines = o3d.utility.Vector2iVector(np.array(lines))
-        line_set_smooth.colors = o3d.utility.Vector3dVector(np.array(colors))
-    else:
-        line_set_smooth.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), dtype=int))
-        line_set_smooth.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+
+def _rotation_from_z_to_vec(vec):
+    """z축([0,0,1])을 vec 방향으로 회전시키는 3x3 행렬."""
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+    v = vec / max(np.linalg.norm(vec), 1e-12)
+    c = np.clip(np.dot(z_axis, v), -1.0, 1.0)
+
+    if c > 0.999999:
+        return np.eye(3)
+    if c < -0.999999:
+        # z축과 반대 방향: x축 기준 180도 회전
+        return np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+
+    axis = np.cross(z_axis, v)
+    axis /= np.linalg.norm(axis)
+    x, y, z = axis
+    s = math.sqrt(max(1.0 - c * c, 0.0))
+    C = 1.0 - c
+    return np.array([
+        [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+        [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+        [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+    ])
+
+
+def _line_width_to_radius(width_value):
+    return float(width_value) * LINE_WIDTH_TO_RADIUS
+
+
+def _build_smooth_mesh():
+    mesh = o3d.geometry.TriangleMesh()
+
+    for stroke, seg_meta in zip(strokes_smooth, strokes_seg_metrics):
+        if len(stroke) < 2:
+            continue
+        for i in range(1, len(stroke)):
+            p0 = np.asarray(stroke[i - 1], dtype=float)
+            p1 = np.asarray(stroke[i], dtype=float)
+            seg = p1 - p0
+            length = np.linalg.norm(seg)
+            if length < 1e-8:
+                continue
+
+            cyl = o3d.geometry.TriangleMesh.create_cylinder(
+                radius=_line_width_to_radius(seg_meta[i - 1]["width"]),
+                height=float(length),
+                resolution=CYLINDER_RESOLUTION,
+                split=1,
+            )
+            cyl.paint_uniform_color(map_metric_to_rgb(seg_meta[i - 1]).tolist())
+            cyl.rotate(_rotation_from_z_to_vec(seg), center=np.zeros(3))
+            cyl.translate((p0 + p1) * 0.5)
+            mesh += cyl
+
+    if len(mesh.vertices) > 0:
+        mesh.compute_vertex_normals()
+    return mesh
+
+
+def refresh_smooth_mesh(vis_obj):
+    global smooth_mesh
+    new_mesh = _build_smooth_mesh()
+    if smooth_mesh is not None:
+        vis_obj.remove_geometry(smooth_mesh, reset_bounding_box=False)
+    smooth_mesh = new_mesh
+    vis_obj.add_geometry(smooth_mesh, reset_bounding_box=False)
 
 
 def update_line_set_raw():
@@ -253,15 +328,22 @@ def set_default_view():
 set_default_view()
 
 
+def apply_line_width(vis_obj):
+    # 현재 brush 두께(line_width)는 "이후 segment"에 적용됨.
+    # 화면 동기화를 위해 갱신은 유지.
+    refresh_smooth_mesh(vis_obj)
+
+
 # ---------- 키 콜백 ----------
 def cb_clear(vis_obj):
-    global strokes_smooth, strokes_raw
+    global strokes_smooth, strokes_raw, strokes_ts, strokes_seg_metrics
     strokes_smooth = [[]]
     strokes_raw = [[]]
+    strokes_ts = [[]]
+    strokes_seg_metrics = [[]]
     euro.reset()
-    update_line_set_smooth()
+    refresh_smooth_mesh(vis_obj)
     update_line_set_raw()
-    vis_obj.update_geometry(line_set_smooth)
     vis_obj.update_geometry(line_set_raw)
     print("[clear]")
     return False
@@ -282,6 +364,31 @@ def cb_toggle_raw(vis_obj):
     return False
 
 
+def cb_toggle_brush_color(vis_obj):
+    global brush_color_index
+    brush_color_index = (brush_color_index + 1) % len(BRUSH_PALETTE)
+    name, _ = BRUSH_PALETTE[brush_color_index]
+    # 기존 segment는 색상 고정이라 그대로 유지. 새로 그리는 선부터 적용.
+    print(f"[brush color] {name} (next segments)")
+    return False
+
+
+def cb_line_width_up(vis_obj):
+    global line_width
+    line_width = min(LINE_WIDTH_MAX, line_width + LINE_WIDTH_STEP)
+    apply_line_width(vis_obj)
+    print(f"[line width] {line_width:.1f}  (next segments)")
+    return False
+
+
+def cb_line_width_down(vis_obj):
+    global line_width
+    line_width = max(LINE_WIDTH_MIN, line_width - LINE_WIDTH_STEP)
+    apply_line_width(vis_obj)
+    print(f"[line width] {line_width:.1f}  (next segments)")
+    return False
+
+
 def cb_save(vis_obj):
     ts = int(time.time())
     fname = f"trajectory_{ts}.png"
@@ -294,6 +401,10 @@ vis.register_key_callback(ord('C'), cb_clear)
 vis.register_key_callback(ord('R'), cb_reset)
 vis.register_key_callback(ord('T'), cb_toggle_raw)
 vis.register_key_callback(ord('S'), cb_save)
+vis.register_key_callback(ord('B'), cb_toggle_brush_color)
+vis.register_key_callback(ord(']'), cb_line_width_up)
+vis.register_key_callback(ord('['), cb_line_width_down)
+apply_line_width(vis)
 
 
 # ============================================================
@@ -323,6 +434,8 @@ print("  3D창 'C'         → 지우기")
 print("  3D창 'R'         → 시점 리셋")
 print("  3D창 'T'         → raw 궤적 토글")
 print("  3D창 'S'         → 스크린샷 저장")
+print("  3D창 'B'         → 브러시 색상 전환 (8 colors)")
+print("  3D창 '[' ']'     → 다음에 그릴 3D 선 두께 조절")
 print("  'q' / ESC        → 종료")
 print("=" * 60)
 
@@ -370,10 +483,23 @@ try:
             if gesture == "draw":
                 cs_s = strokes_smooth[-1]
                 cs_r = strokes_raw[-1]
+                cs_t = strokes_ts[-1]
+                cs_m = strokes_seg_metrics[-1]
                 if len(cs_s) < MAX_POINTS_PER_STROKE:
                     if len(cs_s) == 0 or np.linalg.norm(tip_smooth - cs_s[-1]) > MIN_POINT_DISTANCE:
+                        if len(cs_s) > 0:
+                            dt = max(now - cs_t[-1], 1e-6)
+                            speed = np.linalg.norm(tip_smooth - cs_s[-1]) / dt
+                            _, rgb = BRUSH_PALETTE[brush_color_index]
+                            seg_metric = {
+                                "speed": float(speed),
+                                "width": float(line_width),
+                                "color": list(rgb),
+                            }
+                            cs_m.append(seg_metric)
                         cs_s.append(tip_smooth.copy())
                         cs_r.append(tip_raw.copy())
+                        cs_t.append(now)
                         need_update_smooth = True
                         if show_raw:
                             need_update_raw = True
@@ -381,6 +507,8 @@ try:
                 if len(strokes_smooth[-1]) > 0:
                     strokes_smooth.append([])
                     strokes_raw.append([])
+                    strokes_ts.append([])
+                    strokes_seg_metrics.append([])
                     euro.reset()  # 새 stroke마다 필터 초기화 → latency 감소
         else:
             # 손 사라지면 필터 리셋 (다시 잡혔을 때 점프 방지)
@@ -397,6 +525,8 @@ try:
             f"Mode: {gesture}",
             f"Strokes: {len(strokes_smooth)}  Pts: {total}",
             f"Show raw: {show_raw} (3D win: T)",
+            f"Brush width(next): {line_width:.1f}",
+            f"Brush color(next): {BRUSH_PALETTE[brush_color_index][0]} (B)",
         ]
         for i, t in enumerate(info):
             y = 30 + i * 30
@@ -406,8 +536,7 @@ try:
         cv2.imshow("Webcam", frame)
 
         if need_update_smooth:
-            update_line_set_smooth()
-            vis.update_geometry(line_set_smooth)
+            refresh_smooth_mesh(vis)
             need_update_smooth = False
         if need_update_raw:
             update_line_set_raw()
@@ -421,6 +550,12 @@ try:
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
             break
+        elif key == ord('b'):
+            cb_toggle_brush_color(vis)
+        elif key == ord(']'):
+            cb_line_width_up(vis)
+        elif key == ord('['):
+            cb_line_width_down(vis)
 
 finally:
     cap.release()
