@@ -13,6 +13,7 @@ Air Canvas 3D - v2 (One Euro Filter 적용)
     (macOS에서도 두께 변화가 눈에 보이도록 개선)
   - 세그먼트별 두께 저장: '['/']'는 이후에 그리는 선에만 적용
   - 세그먼트별 색상 저장: 'B'는 이후에 그리는 선에만 적용
+  - Backspace undo: 제스처와 무관하게 고정 픽셀 길이만큼 tail 삭제
 
 제스처:
   - 검지만 펼침         → drawing mode
@@ -25,6 +26,7 @@ Air Canvas 3D - v2 (One Euro Filter 적용)
   - 's'                 → 현재 3D 뷰 PNG 저장
   - 'b'                 → 브러시 색상 전환 (빨주노초파남보/검정)
   - '[' / ']'           → 3D 선 두께 감소/증가
+  - Backspace           → 고정 픽셀 길이 undo
   - 'q' / ESC           → 종료
   - (웹캠 창에서도 동일)
 """
@@ -58,11 +60,12 @@ BRUSH_PALETTE = [
 ]
 brush_color_index = 0
 LINE_WIDTH_MIN = 1.0
-LINE_WIDTH_MAX = 12.0
+LINE_WIDTH_MAX = 30.0
 LINE_WIDTH_STEP = 1.0
 line_width = 3.0
 LINE_WIDTH_TO_RADIUS = 0.0009    # line_width -> cylinder radius 변환
 CYLINDER_RESOLUTION = 10
+ERASE_PIXELS_PER_PRESS = 180.0   # Backspace 1회당 지울 누적 픽셀 길이
 
 # One Euro filter 파라미터 (튜닝 가능)
 # x/y는 비교적 정확하니 약하게, z는 노이즈 많으니 강하게
@@ -196,6 +199,7 @@ vis.add_geometry(axis)
 # 데이터 구조
 strokes_smooth = [[]]   # smoothed 궤적
 strokes_raw = [[]]      # raw 궤적 (비교용)
+strokes_px = [[]]       # webcam 픽셀 궤적 (undo 길이 계산용)
 strokes_ts = [[]]       # 포인트 timestamp
 strokes_seg_metrics = [[]]  # 각 segment 메타데이터 [{"speed":.., "width":.., "color":[r,g,b]}, ...]
 
@@ -334,11 +338,94 @@ def apply_line_width(vis_obj):
     refresh_smooth_mesh(vis_obj)
 
 
+def _compact_trailing_empty_strokes():
+    """말단의 빈 stroke를 정리하되 최소 1개는 유지."""
+    global strokes_smooth, strokes_raw, strokes_px, strokes_ts, strokes_seg_metrics
+    while (
+        len(strokes_smooth) > 1
+        and len(strokes_smooth[-1]) == 0
+        and len(strokes_smooth[-2]) == 0
+    ):
+        strokes_smooth.pop()
+        strokes_raw.pop()
+        strokes_px.pop()
+        strokes_ts.pop()
+        strokes_seg_metrics.pop()
+
+
+def _ensure_nonempty_container():
+    """모든 stroke가 비어 있으면 기본 빈 stroke 1개로 초기화."""
+    global strokes_smooth, strokes_raw, strokes_px, strokes_ts, strokes_seg_metrics
+    if all(len(s) == 0 for s in strokes_smooth):
+        strokes_smooth = [[]]
+        strokes_raw = [[]]
+        strokes_px = [[]]
+        strokes_ts = [[]]
+        strokes_seg_metrics = [[]]
+
+
+def cb_undo_backspace(vis_obj):
+    """
+    Backspace 한 번당 tail에서 일정 픽셀 길이만큼 삭제.
+    손가락 제스처와 무관하게 동작.
+    """
+    remaining = ERASE_PIXELS_PER_PRESS
+    removed_any = False
+
+    while remaining > 0:
+        idx = -1
+        for i in range(len(strokes_smooth) - 1, -1, -1):
+            if len(strokes_smooth[i]) > 0:
+                idx = i
+                break
+        if idx < 0:
+            break
+
+        ss = strokes_smooth[idx]
+        rr = strokes_raw[idx]
+        pp = strokes_px[idx]
+        tt = strokes_ts[idx]
+        mm = strokes_seg_metrics[idx]
+
+        if len(ss) == 1:
+            ss.pop()
+            rr.pop()
+            pp.pop()
+            tt.pop()
+            mm.clear()
+            remaining -= 1.0
+            removed_any = True
+            continue
+
+        # 마지막 segment 길이(픽셀)
+        seg_len = float(np.linalg.norm(np.array(pp[-1]) - np.array(pp[-2])))
+        ss.pop()
+        rr.pop()
+        pp.pop()
+        tt.pop()
+        if mm:
+            mm.pop()
+        remaining -= max(seg_len, 1.0)
+        removed_any = True
+
+    if removed_any:
+        _compact_trailing_empty_strokes()
+        _ensure_nonempty_container()
+        refresh_smooth_mesh(vis_obj)
+        update_line_set_raw()
+        vis_obj.update_geometry(line_set_raw)
+        print(f"[undo] erased ~{ERASE_PIXELS_PER_PRESS:.0f}px")
+    else:
+        print("[undo] nothing to erase")
+    return False
+
+
 # ---------- 키 콜백 ----------
 def cb_clear(vis_obj):
-    global strokes_smooth, strokes_raw, strokes_ts, strokes_seg_metrics
+    global strokes_smooth, strokes_raw, strokes_px, strokes_ts, strokes_seg_metrics
     strokes_smooth = [[]]
     strokes_raw = [[]]
+    strokes_px = [[]]
     strokes_ts = [[]]
     strokes_seg_metrics = [[]]
     euro.reset()
@@ -404,6 +491,9 @@ vis.register_key_callback(ord('S'), cb_save)
 vis.register_key_callback(ord('B'), cb_toggle_brush_color)
 vis.register_key_callback(ord(']'), cb_line_width_up)
 vis.register_key_callback(ord('['), cb_line_width_down)
+# GLFW KEY_BACKSPACE = 259, KEY_DELETE = 261
+vis.register_key_callback(259, cb_undo_backspace)
+vis.register_key_callback(261, cb_undo_backspace)
 apply_line_width(vis)
 
 
@@ -436,6 +526,7 @@ print("  3D창 'T'         → raw 궤적 토글")
 print("  3D창 'S'         → 스크린샷 저장")
 print("  3D창 'B'         → 브러시 색상 전환 (8 colors)")
 print("  3D창 '[' ']'     → 다음에 그릴 3D 선 두께 조절")
+print(f"  Backspace/Delete  → 약 {ERASE_PIXELS_PER_PRESS:.0f}px undo")
 print("  'q' / ESC        → 종료")
 print("=" * 60)
 
@@ -483,6 +574,7 @@ try:
             if gesture == "draw":
                 cs_s = strokes_smooth[-1]
                 cs_r = strokes_raw[-1]
+                cs_p = strokes_px[-1]
                 cs_t = strokes_ts[-1]
                 cs_m = strokes_seg_metrics[-1]
                 if len(cs_s) < MAX_POINTS_PER_STROKE:
@@ -499,6 +591,7 @@ try:
                             cs_m.append(seg_metric)
                         cs_s.append(tip_smooth.copy())
                         cs_r.append(tip_raw.copy())
+                        cs_p.append((cx, cy))
                         cs_t.append(now)
                         need_update_smooth = True
                         if show_raw:
@@ -507,6 +600,7 @@ try:
                 if len(strokes_smooth[-1]) > 0:
                     strokes_smooth.append([])
                     strokes_raw.append([])
+                    strokes_px.append([])
                     strokes_ts.append([])
                     strokes_seg_metrics.append([])
                     euro.reset()  # 새 stroke마다 필터 초기화 → latency 감소
@@ -527,6 +621,7 @@ try:
             f"Show raw: {show_raw} (3D win: T)",
             f"Brush width(next): {line_width:.1f}",
             f"Brush color(next): {BRUSH_PALETTE[brush_color_index][0]} (B)",
+            f"Undo range: {ERASE_PIXELS_PER_PRESS:.0f}px (Backspace)",
         ]
         for i, t in enumerate(info):
             y = 30 + i * 30
@@ -556,6 +651,8 @@ try:
             cb_line_width_up(vis)
         elif key == ord('['):
             cb_line_width_down(vis)
+        elif key in (8, 127):
+            cb_undo_backspace(vis)
 
 finally:
     cap.release()
