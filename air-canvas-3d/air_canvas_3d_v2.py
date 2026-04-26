@@ -14,10 +14,12 @@ Air Canvas 3D - v2 (One Euro Filter 적용)
   - 세그먼트별 두께 저장: '['/']'는 이후에 그리는 선에만 적용
   - 세그먼트별 색상 저장: 'B'는 이후에 그리는 선에만 적용
   - Backspace undo: 제스처와 무관하게 고정 픽셀 길이만큼 tail 삭제
+  - 새끼손가락 줌 제어: 새끼손가락만 핀 상태에서 위=zoom in, 아래=zoom out
 
 제스처:
   - 검지만 펼침         → drawing mode
   - 검지+중지 펼침      → pen up
+  - 새끼손가락만 펼침    → zoom control
 
 3D 창 키:
   - 'c'                 → 모두 지우기
@@ -46,6 +48,12 @@ FRAME_W, FRAME_H = 1280, 720
 Z_AMPLIFY = 5.0
 MAX_POINTS_PER_STROKE = 5000
 MIN_POINT_DISTANCE = 0.003       # 너무 촘촘한 점 제거
+PINKY_ZOOM_DEADZONE = 0.003      # 새끼손가락 y 이동 deadzone
+PINKY_ZOOM_SENSITIVITY = 2.8     # y 변화량 -> zoom 변화 비율
+ZOOM_MIN = 0.10
+ZOOM_MAX = 3.0
+PINKY_UP_MARGIN = 0.020          # 새끼손가락 펴짐 판정 완화
+OTHER_FOLDED_MARGIN = 0.020      # 나머지 손가락 접힘 판정 완화
 
 # Brush 스타일
 BRUSH_PALETTE = [
@@ -169,6 +177,20 @@ def classify_gesture(landmarks):
     mid = is_finger_extended(landmarks, "middle")
     ring = is_finger_extended(landmarks, "ring")
     pinky = is_finger_extended(landmarks, "pinky")
+
+    # zoom 제스처는 엄지 상태를 무시하고, 새끼손가락만 강조해서 인식
+    idx_tip, idx_pip = landmarks[TIP_IDS["index"]], landmarks[PIP_IDS["index"]]
+    mid_tip, mid_pip = landmarks[TIP_IDS["middle"]], landmarks[PIP_IDS["middle"]]
+    ring_tip, ring_pip = landmarks[TIP_IDS["ring"]], landmarks[PIP_IDS["ring"]]
+    pinky_tip, pinky_pip = landmarks[TIP_IDS["pinky"]], landmarks[PIP_IDS["pinky"]]
+
+    pinky_up = pinky_tip.y < (pinky_pip.y + PINKY_UP_MARGIN)
+    idx_folded = idx_tip.y > (idx_pip.y - OTHER_FOLDED_MARGIN)
+    mid_folded = mid_tip.y > (mid_pip.y - OTHER_FOLDED_MARGIN)
+    ring_folded = ring_tip.y > (ring_pip.y - OTHER_FOLDED_MARGIN)
+
+    if pinky_up and idx_folded and mid_folded and ring_folded:
+        return "zoom_control"
     if idx and not mid and not ring and not pinky:
         return "draw"
     if idx and mid and not ring and not pinky:
@@ -330,6 +352,8 @@ def set_default_view():
 
 
 set_default_view()
+current_zoom = 0.6
+prev_pinky_y = None
 
 
 def apply_line_width(vis_obj):
@@ -437,7 +461,10 @@ def cb_clear(vis_obj):
 
 
 def cb_reset(vis_obj):
+    global current_zoom, prev_pinky_y
     set_default_view()
+    current_zoom = 0.6
+    prev_pinky_y = None
     print("[reset view]")
     return False
 
@@ -520,6 +547,7 @@ print("Air Canvas 3D v2 - One Euro Filter")
 print("=" * 60)
 print("  검지만 펼침      → 그리기")
 print("  검지+중지 펼침   → pen up")
+print("  새끼손가락만 펼침 → 위로 이동: zoom in / 아래로 이동: zoom out")
 print("  3D창 'C'         → 지우기")
 print("  3D창 'R'         → 시점 리셋")
 print("  3D창 'T'         → raw 궤적 토글")
@@ -544,23 +572,42 @@ try:
         rgb.flags.writeable = True
 
         now = time.perf_counter()
-        fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 1e-6))
+        frame_dt = max(now - prev_time, 1e-6)
+        fps = 0.9 * fps + 0.1 * (1.0 / frame_dt)
         prev_time = now
 
         gesture = "no_hand"
 
         if results.multi_hand_landmarks:
             hand_landmarks = results.multi_hand_landmarks[0]
+            lm = hand_landmarks.landmark
             mp_drawing.draw_landmarks(
                 frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
                 mp_styles.get_default_hand_landmarks_style(),
                 mp_styles.get_default_hand_connections_style(),
             )
-            gesture = classify_gesture(hand_landmarks.landmark)
+            gesture = classify_gesture(lm)
 
             tip_lm = hand_landmarks.landmark[TIP_IDS["index"]]
             tip_raw = landmark_to_3d(tip_lm)
             tip_smooth = euro(tip_raw, now)
+
+            if gesture == "zoom_control":
+                pinky_tip = lm[TIP_IDS["pinky"]]
+                if prev_pinky_y is not None:
+                    dy = pinky_tip.y - prev_pinky_y  # 위로 이동하면 음수
+                    if abs(dy) > PINKY_ZOOM_DEADZONE:
+                        current_zoom = float(
+                            np.clip(
+                                current_zoom - dy * PINKY_ZOOM_SENSITIVITY,
+                                ZOOM_MIN,
+                                ZOOM_MAX,
+                            )
+                        )
+                        vis.get_view_control().set_zoom(current_zoom)
+                prev_pinky_y = pinky_tip.y
+            else:
+                prev_pinky_y = None
 
             # 마커는 smoothed 좌표로
             delta = tip_smooth - prev_marker_pos
@@ -607,10 +654,12 @@ try:
         else:
             # 손 사라지면 필터 리셋 (다시 잡혔을 때 점프 방지)
             euro.reset()
+            prev_pinky_y = None
 
         # HUD
         mode_color = {
             "draw": (0, 255, 0), "pen_up": (0, 255, 255),
+            "zoom_control": (255, 140, 0),
             "other": (180, 180, 180), "no_hand": (0, 0, 255),
         }.get(gesture, (255, 255, 255))
         total = sum(len(s) for s in strokes_smooth)
@@ -622,6 +671,7 @@ try:
             f"Brush width(next): {line_width:.1f}",
             f"Brush color(next): {BRUSH_PALETTE[brush_color_index][0]} (B)",
             f"Undo range: {ERASE_PIXELS_PER_PRESS:.0f}px (Backspace)",
+            f"Zoom: {current_zoom:.2f}",
         ]
         for i, t in enumerate(info):
             y = 30 + i * 30
